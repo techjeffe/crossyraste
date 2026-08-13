@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Crossy Raste - Survive Bengaluru Traffic</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9B%BA%3C/text%3E%3C/svg%3E">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#111; font-family:'Poppins', sans-serif;
+    touch-action:none; -webkit-user-select:none; user-select:none;
+  }
+  #gameContainer {
+    position:relative; width:100vw; height:100vh;
+    display:flex; align-items:center; justify-content:center;
+  }
+  canvas { display:block; background:#4a4a4a; }
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="gameCanvas"></canvas>
+</div>
+
+<script>
+'use strict';
+
+/* =========================================================================
+   CONFIG
+   ========================================================================= */
+const CONFIG = {
+  TILE_SIZE: 60,   // mutated at runtime by Game.resize() to scale with viewport
+  COLS: 7,
+  MIN_TILE: 34,
+  MAX_TILE: 112,
+  HOP_DURATION: 0.13,        // seconds per hop animation
+  PLAYER_EMOJI: '🧍‍♂️',
+  BACKPACK_EMOJI: '🎒',
+
+  // Rush-hour / time-of-day progression. Index derived from floor(row/10).
+  TIMES: [
+    { hour: 8,  label: '8:00 AM',  rush: 'CALM',    speedMult: 1.0, densityMult: 1.0 },
+    { hour: 9,  label: '9:00 AM',  rush: 'BUSY',     speedMult: 1.2, densityMult: 1.2, weave: true },
+    { hour: 10, label: '10:00 AM', rush: 'BUSY',     speedMult: 1.3, densityMult: 1.4, weave: true },
+    { hour: 12, label: '12:00 PM', rush: 'CHAOS',    speedMult: 1.4, densityMult: 1.5 },
+    { hour: 14, label: '2:00 PM',  rush: 'CHAOS',    speedMult: 1.45,densityMult: 1.6 },
+    { hour: 16, label: '4:00 PM',  rush: 'CHAOS',    speedMult: 1.5, densityMult: 1.7 },
+    { hour: 18, label: '6:00 PM',  rush: 'PEAK 🔥',  speedMult: 2.0, densityMult: 2.0, peak: true, rain: true },
+    { hour: 19, label: '7:00 PM',  rush: 'PEAK 🔥',  speedMult: 2.0, densityMult: 2.0, peak: true, rain: true },
+    { hour: 20, label: '8:00 PM',  rush: 'NIGHT',    speedMult: 1.3, densityMult: 0.6, night: true }
+  ],
+
+  LANE_TYPES: ['footpath', 'auto', 'bus', 'car', 'pothole', 'barrier', 'bike'],
+
+  DEATH_MESSAGES: [
+    "You assumed the auto had a working meter.",
+    "You made eye contact with an IT shuttle driver.",
+    "You thought the pothole was just a shadow.",
+    "You waited for the pedestrian signal. Rookie mistake.",
+    "The cow won.",
+    "You got stuck behind a Zomato delivery bike doing 80kmph.",
+    "You trusted the Google Maps ETA.",
+    "You thought that gap in the roundabout was big enough.",
+    "An Ola driver cancelled mid-crossing.",
+    "You hesitated. In Bengaluru, hesitation is death."
+  ],
+
+  COLORS: {
+    asphalt: '#4a4a4a',
+    footpath: '#d4b896',
+    road: '#4d4d4d',
+    roundaboutRing: '#c67b4b',
+    roundaboutIsland: '#3f8d4f',
+    laneMarking: 'rgba(255,255,255,0.5)',
+    auto: '#ffd21e',
+    bus: '#1e3a8a',
+    car: ['#eeeeee', '#c9c9c9', '#e05a5a', '#5a7de0', '#e0c15a'],
+    bike: '#e04b4b',
+    cow: '#8b5a2b',
+    pothole: '#1f1f1f',
+    barrier: '#ff7a1a',
+    nightBg: '#141428',
+    headlight: '#fff6c8',
+    buildingDay: ['#8a7c6d', '#77695c', '#6b5f54'],
+    buildingNight: ['#20202f', '#191925', '#242434'],
+    sky: '#87ceeb',
+    skyNight: '#0a0a1a'
+  }
+};
+
+/* =========================================================================
+   AUDIO  (Web Audio API — all sounds generated procedurally)
+   ========================================================================= */
+class AudioManager {
+  constructor() {
+    this.ctx = null;
+    this.rainSource = null;
+    this.rainGain = null;
+    this.muted = localStorage.getItem('crossyRasteMuted') === '1';
+  }
+
+  setMuted(m) {
+    this.muted = m;
+    localStorage.setItem('crossyRasteMuted', m ? '1' : '0');
+    if (this.rainGain) this.rainGain.gain.value = m ? 0 : 0.04;
+  }
+
+  init() {
+    if (this.ctx) return;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (e) { /* Web Audio unsupported — game still playable, silently */ }
+  }
+
+  resume() {
+    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+  }
+
+  _tone(freq0, freq1, dur, gain, type = 'square') {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq0, t0);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(freq1, 1), t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(g); g.connect(this.ctx.destination);
+    osc.start(t0); osc.stop(t0 + dur);
+  }
+
+  playHonk() { this._tone(420, 300, 0.16, 0.18, 'square'); }
+
+  playHop() { this._tone(900, 700, 0.06, 0.1, 'triangle'); }
+
+  playDeath() {
+    if (!this.ctx || this.muted) return;
+    this._tone(500, 60, 0.55, 0.3, 'sawtooth');
+    // noise burst
+    const t0 = this.ctx.currentTime;
+    const bufSize = this.ctx.sampleRate * 0.4;
+    const buf = this.ctx.createBuffer(1, bufSize, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.25, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.4);
+    src.connect(g); g.connect(this.ctx.destination);
+    src.start(t0);
+  }
+
+  playLevelUp() { this._tone(500, 1100, 0.28, 0.15, 'sine'); }
+
+  playStun() { this._tone(250, 180, 0.25, 0.15, 'sawtooth'); }
+
+  playRoundaboutFanfare() {
+    if (!this.ctx) return;
+    for (let i = 0; i < 4; i++) {
+      setTimeout(() => this._tone(350 + Math.random() * 200, 250, 0.14, 0.15, 'square'), i * 90);
+    }
+  }
+
+  startRain() {
+    if (!this.ctx || this.rainSource) return;
+    const bufSize = this.ctx.sampleRate * 2;
+    const buf = this.ctx.createBuffer(1, bufSize, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+    this.rainSource = this.ctx.createBufferSource();
+    this.rainSource.buffer = buf;
+    this.rainSource.loop = true;
+    this.rainGain = this.ctx.createGain();
+    this.rainGain.gain.value = this.muted ? 0 : 0.04;
+    this.rainSource.connect(this.rainGain);
+    this.rainGain.connect(this.ctx.destination);
+    this.rainSource.start();
+  }
+
+  stopRain() {
+    if (this.rainSource) {
+      try { this.rainSource.stop(); } catch (e) {}
+      this.rainSource.disconnect();
+      this.rainSource = null;
+    }
+  }
+}
+
+/* =========================================================================
+   WORLD_GEN — lane generation, keyed by row number, generated sequentially
+   ========================================================================= */
+class WorldGenerator {
+  constructor() {
+    this.laneCache = new Map();
+    this.generatedUpTo = -1;     // highest row index generated so far
+    this.nextRoundaboutRow = 9 + Math.floor(Math.random() * 3);
+  }
+
+  getTimeData(row) {
+    const idx = Math.min(Math.floor(row / 10), CONFIG.TIMES.length - 1);
+    return CONFIG.TIMES[idx];
+  }
+
+  ensureUpTo(row, gs) {
+    while (this.generatedUpTo < row) {
+      this.generateLane(this.generatedUpTo + 1, gs);
+    }
+  }
+
+  getLane(row, gs) {
+    if (row < 0) return this.laneCache.get(0) || this.generateLane(0, gs);
+    this.ensureUpTo(row, gs);
+    return this.laneCache.get(row);
+  }
+
+  prune(minRow) {
+    for (const key of this.laneCache.keys()) {
+      if (key < minRow - 10) this.laneCache.delete(key);
+    }
+  }
+
+  generateLane(row, gs) {
+    let type;
+    if (row < 3) {
+      type = 'footpath';
+    } else if (row >= this.nextRoundaboutRow) {
+      type = 'roundabout';
+      this.nextRoundaboutRow = row + 8 + Math.floor(Math.random() * 3);
+    } else {
+      const pool = CONFIG.LANE_TYPES;
+      type = pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    const lane = { row, type, vehicles: [], special: {} };
+    const td = this.getTimeData(row);
+
+    switch (type) {
+      case 'footpath':  this._genFootpath(lane, gs, td); break;
+      case 'auto':      this._genAuto(lane, gs, td); break;
+      case 'bus':       this._genBus(lane, gs, td); break;
+      case 'car':       this._genCar(lane, gs, td); break;
+      case 'bike':      this._genBike(lane, gs, td); break;
+      case 'roundabout':this._genRoundabout(lane, gs, td); break;
+      case 'pothole':   this._genPothole(lane, gs, td); break;
+      case 'barrier':   this._genBarrier(lane, gs, td); break;
+    }
+
+    this.laneCache.set(row, lane);
+    this.generatedUpTo = row;
+    return lane;
+  }
+
+  _genFootpath(lane, gs, td) {
+    const count = Math.floor(Math.random() * 3); // 0-2 wanderers
+    for (let i = 0; i < count; i++) {
+      const isCow = Math.random() < 0.25;
+      lane.vehicles.push({
+        type: isCow ? 'cow' : 'pedestrian',
+        x: Math.random() * gs.roadWidth,
+        dir: Math.random() < 0.5 ? 1 : -1,
+        speed: (isCow ? 12 : 18) + Math.random() * 12,
+        wanderTimer: 1 + Math.random() * 2
+      });
+    }
+  }
+
+  _genAuto(lane, gs, td) {
+    const clusters = Math.max(1, Math.round(2 * td.densityMult));
+    for (let c = 0; c < clusters; c++) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      const baseX = Math.random() * gs.roadWidth;
+      const baseSpeed = (70 + Math.random() * 40) * td.speedMult * dir;
+      for (let i = 0; i < 3; i++) {
+        lane.vehicles.push({
+          type: 'auto',
+          x: (baseX + i * 65 * dir + gs.roadWidth) % gs.roadWidth,
+          dir,
+          speed: baseSpeed,
+          wobblePhase: Math.random() * Math.PI * 2,
+          wobbleAmp: td.weave ? 10 : 4,
+          honkCd: Math.random() * 1.5
+        });
+      }
+    }
+  }
+
+  _genBus(lane, gs, td) {
+    const count = 2 + Math.floor(Math.random() * 2);
+    const labels = ['Infosys', 'Wipro', 'TCS', 'Deloitte'];
+    for (let i = 0; i < count; i++) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      lane.vehicles.push({
+        type: 'bus',
+        x: (i / count) * gs.roadWidth + Math.random() * 40,
+        dir,
+        speed: (28 + Math.random() * 12) * td.speedMult * dir,
+        label: labels[Math.floor(Math.random() * labels.length)],
+        honkCd: Math.random() * 1.5
+      });
+    }
+  }
+
+  _genCar(lane, gs, td) {
+    const count = Math.max(2, Math.round((3 + Math.random() * 2) * td.densityMult));
+    for (let i = 0; i < count; i++) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      lane.vehicles.push({
+        type: 'car',
+        x: Math.random() * gs.roadWidth,
+        dir,
+        speed: (55 + Math.random() * 35) * td.speedMult * dir,
+        color: CONFIG.COLORS.car[Math.floor(Math.random() * CONFIG.COLORS.car.length)],
+        isOla: Math.random() < 0.3,
+        laneChangeTimer: 1 + Math.random() * 3,
+        honkCd: Math.random() * 1.5
+      });
+    }
+  }
+
+  _genBike(lane, gs, td) {
+    const packs = Math.max(1, Math.round(td.densityMult));
+    for (let p = 0; p < packs; p++) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      const baseX = Math.random() * gs.roadWidth;
+      const baseSpeed = (110 + Math.random() * 40) * td.speedMult * dir;
+      const packSize = 4 + Math.floor(Math.random() * 2);
+      for (let i = 0; i < packSize; i++) {
+        lane.vehicles.push({
+          type: 'bike',
+          x: (baseX + i * 30 * dir + gs.roadWidth) % gs.roadWidth,
+          dir,
+          speed: baseSpeed,
+          honkCd: Math.random() * 1.5
+        });
+      }
+    }
+  }
+
+  _genRoundabout(lane, gs, td) {
+    const radius = Math.min(gs.roadWidth, 4 * CONFIG.TILE_SIZE) * 0.34;
+    lane.special = { radius, entryFlashed: false };
+    const count = Math.max(4, Math.round(8 * td.densityMult));
+    const types = ['auto', 'car', 'bike'];
+    for (let i = 0; i < count; i++) {
+      lane.vehicles.push({
+        type: types[Math.floor(Math.random() * types.length)],
+        angle: (i / count) * Math.PI * 2,
+        orbitRadius: radius * (0.55 + Math.random() * 0.5),
+        angSpeed: (0.6 + Math.random() * 0.6) * td.speedMult * (Math.random() < 0.5 ? 1 : -1),
+        honkCd: Math.random() * 1.5
+      });
+    }
+  }
+
+  _genPothole(lane, gs, td) {
+    const tileCount = Math.round(gs.roadWidth / CONFIG.TILE_SIZE);
+    lane.special.potholes = [];
+    for (let i = 0; i < tileCount; i++) {
+      if (Math.random() < 0.35) lane.special.potholes.push(i);
+    }
+    // guarantee at least one safe column
+    if (lane.special.potholes.length >= tileCount) lane.special.potholes.pop();
+  }
+
+  _genBarrier(lane, gs, td) {
+    const tileCount = Math.round(gs.roadWidth / CONFIG.TILE_SIZE);
+    lane.special.gapCount = 1 + Math.floor(Math.random() * 2);
+    lane.special.tileCount = tileCount;
+    lane.special.shiftInterval = 3.5;
+    lane.special.shiftTimer = lane.special.shiftInterval;
+    lane.special.gaps = this._pickGaps(tileCount, lane.special.gapCount);
+  }
+
+  _pickGaps(tileCount, n) {
+    const gaps = new Set();
+    while (gaps.size < Math.min(n, tileCount)) gaps.add(Math.floor(Math.random() * tileCount));
+    return [...gaps];
+  }
+}
+
+/* =========================================================================
+   VEHICLES — per-frame physics update + honk-proximity logic
+   ========================================================================= */
+const Vehicles = {
+  BASE_DIMS: {
+    auto: { w: 46, h: 34 },
+    bus: { w: 118, h: 46 },
+    car: { w: 50, h: 34 },
+    bike: { w: 26, h: 18 },
+    cow: { w: 30, h: 26 },
+    pedestrian: { w: 24, h: 24 }
+  },
+
+  // Vehicle footprints scale with tile size so proportions hold on any screen.
+  dims(type) {
+    const base = this.BASE_DIMS[type] || { w: 40, h: 30 };
+    const s = CONFIG.TILE_SIZE / 60;
+    return { w: base.w * s, h: base.h * s };
+  },
+
+  update(lane, gs, dt) {
+    const roadWidth = gs.roadWidth;
+    if (lane.type === 'roundabout') {
+      lane.vehicles.forEach(v => { v.angle += v.angSpeed * dt; });
+    } else if (lane.type === 'footpath') {
+      lane.vehicles.forEach(v => {
+        v.wanderTimer -= dt;
+        if (v.wanderTimer <= 0) {
+          v.dir = Math.random() < 0.5 ? 1 : -1;
+          v.wanderTimer = 1 + Math.random() * 2;
+        }
+        v.x += v.dir * v.speed * dt;
+        if (v.x < 0) { v.x = 0; v.dir = 1; }
+        if (v.x > roadWidth) { v.x = roadWidth; v.dir = -1; }
+      });
+    } else {
+      lane.vehicles.forEach(v => {
+        v.x += v.speed * dt;
+        if (v.speed > 0 && v.x > roadWidth + 70) v.x = -70;
+        if (v.speed < 0 && v.x < -70) v.x = roadWidth + 70;
+
+        if (lane.type === 'auto') {
+          v.wobblePhase += dt * 4;
+          v.wobbleX = Math.sin(v.wobblePhase) * v.wobbleAmp;
+        }
+        if (lane.type === 'car') {
+          v.laneChangeTimer -= dt;
+          if (v.laneChangeTimer <= 0) {
+            v.speed *= (0.8 + Math.random() * 0.5);
+            v.laneChangeTimer = 2 + Math.random() * 3;
+          }
+        }
+        if (v.honkCd !== undefined) v.honkCd -= dt;
+      });
+    }
+
+    if (lane.type === 'barrier' && lane.special.gaps) {
+      lane.special.shiftTimer -= dt;
+      if (lane.special.shiftTimer <= 0) {
+        lane.special.gaps = gs.worldGen._pickGaps(lane.special.tileCount, lane.special.gapCount);
+        lane.special.shiftTimer = lane.special.shiftInterval;
+      }
+    }
+  },
+
+  // Local x-position (relative to lane, 0..roadWidth) and effective column
+  localX(v, lane) {
+    if (lane.type === 'roundabout') {
+      return lane.special.radius && lane.special.cx !== undefined
+        ? lane.special.cx + Math.cos(v.angle) * v.orbitRadius
+        : Math.cos(v.angle) * v.orbitRadius;
+    }
+    return v.x + (v.wobbleX || 0);
+  }
+};
+
+/* =========================================================================
+   PLAYER
+   ========================================================================= */
+class Player {
+  constructor(cols) {
+    this.row = 0;
+    this.col = Math.floor(cols / 2);
+    this.visualRow = 0;
+    this.visualCol = this.col;
+    this.startRow = 0;
+    this.startCol = this.col;
+    this.moving = false;
+    this.animT = 0;
+    this.stunned = false;
+    this.stunnedTimer = 0;
+    this.dead = false;
+    this.bestRow = 0;
+    this.facing = 'up';
+    this.landed = false; // one-shot flag: true for a single frame after a hop completes
+  }
+
+  move(dCol, dRow, gs) {
+    if (this.moving || this.stunned || this.dead) return;
+    const newCol = this.col + dCol;
+    const newRow = Math.max(0, this.row + dRow);
+    if (newCol < 0 || newCol >= gs.cols) return;
+    if (newCol === this.col && newRow === this.row) return;
+
+    if (dCol > 0) this.facing = 'right';
+    else if (dCol < 0) this.facing = 'left';
+    else if (dRow > 0) this.facing = 'up';
+    else if (dRow < 0) this.facing = 'down';
+
+    this.startRow = this.row;
+    this.startCol = this.col;
+    this.row = newRow;
+    this.col = newCol;
+    this.moving = true;
+    this.animT = 0;
+
+    gs.audio.playHop();
+
+    if (this.row > this.bestRow) {
+      this.bestRow = this.row;
+      if (this.bestRow % 10 === 0) gs.audio.playLevelUp();
+    }
+  }
+
+  update(dt, gs) {
+    if (this.dead) return;
+    if (this.moving) {
+      this.animT += dt / CONFIG.HOP_DURATION;
+      const t = Math.min(1, this.animT);
+      const ease = 1 - Math.pow(1 - t, 2);
+      this.visualRow = this.startRow + (this.row - this.startRow) * ease;
+      this.visualCol = this.startCol + (this.col - this.startCol) * ease;
+      if (t >= 1) {
+        this.visualRow = this.row;
+        this.visualCol = this.col;
+        this.moving = false;
+        this.landed = true;
+      }
+    }
+    if (this.stunned) {
+      this.stunnedTimer -= dt;
+      if (this.stunnedTimer <= 0) this.stunned = false;
+    }
+  }
+
+  hopArc() {
+    // 0..1..0 arc height for a little jump bounce
+    return this.moving ? Math.sin(Math.min(1, this.animT) * Math.PI) * 10 : 0;
+  }
+
+  stun(gs) {
+    if (this.stunned || this.dead) return;
+    this.stunned = true;
+    this.stunnedTimer = 1;
+    gs.audio.playStun();
+  }
+
+  die(gs) {
+    if (this.dead) return;
+    this.dead = true;
+    gs.gameOver = true;
+    gs.deathMessage = CONFIG.DEATH_MESSAGES[Math.floor(Math.random() * CONFIG.DEATH_MESSAGES.length)];
+    gs.audio.playDeath();
+    gs.audio.stopRain();
+    gs.recordScore();
+  }
+}
+
+/* =========================================================================
+   RENDERER
+   ========================================================================= */
+const Renderer = {
+  draw(gs) {
+    const ctx = gs.ctx;
+    const td = gs.worldGen.getTimeData(gs.player.bestRow);
+
+    ctx.fillStyle = td.night ? CONFIG.COLORS.nightBg : CONFIG.COLORS.asphalt;
+    ctx.fillRect(0, 0, gs.canvasWidth, gs.canvasHeight);
+
+    this.drawParallax(gs, td);
+
+    const baseY = gs.baseY;
+    const rowSpan = (gs.canvasHeight / CONFIG.TILE_SIZE) + 2;
+    const rowsBelow = (gs.canvasHeight - baseY) / CONFIG.TILE_SIZE + 1;
+    const minRow = Math.max(0, Math.floor(gs.player.visualRow - rowsBelow));
+    const maxRow = Math.ceil(gs.player.visualRow + rowSpan);
+
+    for (let r = minRow; r <= maxRow; r++) {
+      const lane = gs.worldGen.getLane(r, gs);
+      const screenY = baseY - (r - gs.player.visualRow) * CONFIG.TILE_SIZE;
+      if (screenY < -CONFIG.TILE_SIZE || screenY > gs.canvasHeight + CONFIG.TILE_SIZE) continue;
+      this.drawLane(ctx, lane, screenY, gs, td);
+    }
+
+    this.drawPlayer(ctx, gs.player, gs);
+    this.drawUI(ctx, gs, td);
+
+    if (td.rain) {
+      ctx.fillStyle = 'rgba(120,130,170,0.18)';
+      ctx.fillRect(0, 0, gs.canvasWidth, gs.canvasHeight);
+      this.drawRainStreaks(ctx, gs);
+    }
+
+    if (gs.bannerTimer > 0) this.drawBanner(ctx, gs, td);
+    if (gs.gameOver) this.drawGameOver(ctx, gs);
+    if (!gs.started) this.drawStartScreen(ctx, gs);
+  },
+
+  drawParallax(gs, td) {
+    const ctx = gs.ctx;
+    const palette = td.night ? CONFIG.COLORS.buildingNight : CONFIG.COLORS.buildingDay;
+    const offset = (gs.player.visualRow * CONFIG.TILE_SIZE * 0.25) % 160;
+    [gs.sideWidth, gs.canvasWidth - gs.sideWidth].forEach((edgeX, side) => {
+      if (gs.sideWidth < 20) return;
+      for (let i = -1; i < gs.canvasHeight / 80 + 2; i++) {
+        const y = gs.canvasHeight - (i * 80) + offset - 80;
+        const w = gs.sideWidth * 0.7;
+        const h = 60 + ((i * 37 + side * 13) % 40);
+        const x = side === 0 ? edgeX - w - 6 : edgeX + 6;
+        ctx.fillStyle = palette[(i + side) % palette.length];
+        ctx.fillRect(x, y - h, w, h);
+        // windows
+        ctx.fillStyle = td.night ? 'rgba(255,230,150,0.5)' : 'rgba(255,255,255,0.15)';
+        for (let wx = 4; wx < w - 4; wx += 10) {
+          for (let wy = 4; wy < h - 4; wy += 14) {
+            if ((wx + wy + i * 7) % 23 < 12) ctx.fillRect(x + wx, y - h + wy, 4, 6);
+          }
+        }
+      }
+    });
+  },
+
+  drawLane(ctx, lane, screenY, gs, td) {
+    const x0 = gs.sideWidth;
+    const w = gs.roadWidth;
+
+    let color = CONFIG.COLORS.road;
+    if (lane.type === 'footpath') color = CONFIG.COLORS.footpath;
+    if (lane.type === 'roundabout') color = CONFIG.COLORS.road;
+    ctx.fillStyle = color;
+    ctx.fillRect(x0, screenY - CONFIG.TILE_SIZE / 2, w, CONFIG.TILE_SIZE);
+
+    if (lane.type !== 'footpath' && lane.type !== 'roundabout') {
+      ctx.strokeStyle = CONFIG.COLORS.laneMarking;
+      ctx.setLineDash([16, 16]);
+      ctx.beginPath();
+      ctx.moveTo(x0, screenY);
+      ctx.lineTo(x0 + w, screenY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (lane.type === 'roundabout') {
+      const cx = x0 + w / 2;
+      const r = lane.special.radius;
+      lane.special.cx = w / 2; // cache local-x center for collision math
+      ctx.fillStyle = CONFIG.COLORS.roundaboutRing;
+      ctx.beginPath(); ctx.arc(cx, screenY, r * 1.7, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = CONFIG.COLORS.road;
+      ctx.beginPath(); ctx.arc(cx, screenY, r * 1.15, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = CONFIG.COLORS.roundaboutIsland;
+      ctx.beginPath(); ctx.arc(cx, screenY, r * 0.45, 0, Math.PI * 2); ctx.fill();
+      ctx.font = `${Math.round(r * 0.5)}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('🌳', cx, screenY);
+    }
+
+    if (lane.type === 'pothole' && lane.special.potholes) {
+      lane.special.potholes.forEach(tileX => {
+        ctx.fillStyle = CONFIG.COLORS.pothole;
+        ctx.beginPath();
+        ctx.ellipse(x0 + tileX * CONFIG.TILE_SIZE + CONFIG.TILE_SIZE / 2, screenY,
+          CONFIG.TILE_SIZE * 0.32, CONFIG.TILE_SIZE * 0.22, 0, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    if (lane.type === 'barrier' && lane.special.gaps) {
+      for (let i = 0; i < lane.special.tileCount; i++) {
+        if (!lane.special.gaps.includes(i)) {
+          ctx.fillStyle = CONFIG.COLORS.barrier;
+          ctx.fillRect(x0 + i * CONFIG.TILE_SIZE + 6, screenY - CONFIG.TILE_SIZE / 2 + 8,
+            CONFIG.TILE_SIZE - 12, CONFIG.TILE_SIZE - 16);
+          ctx.font = '18px sans-serif';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText('🚧', x0 + i * CONFIG.TILE_SIZE + CONFIG.TILE_SIZE / 2, screenY);
+        }
+      }
+    }
+
+    lane.vehicles.forEach(v => this.drawVehicle(ctx, v, lane, screenY, gs, td));
+  },
+
+  drawVehicle(ctx, v, lane, screenY, gs, td) {
+    const localX = Vehicles.localX(v, lane);
+    const cx = lane.type === 'roundabout'
+      ? gs.sideWidth + gs.roadWidth / 2 + Math.cos(v.angle) * v.orbitRadius
+      : gs.sideWidth + localX;
+    const cy = lane.type === 'roundabout' ? screenY + Math.sin(v.angle) * v.orbitRadius : screenY;
+
+    const dims = Vehicles.dims(v.type);
+    let color = CONFIG.COLORS.car[0];
+    if (v.type === 'auto') color = CONFIG.COLORS.auto;
+    if (v.type === 'bus') color = CONFIG.COLORS.bus;
+    if (v.type === 'bike') color = CONFIG.COLORS.bike;
+    if (v.type === 'cow') color = CONFIG.COLORS.cow;
+    if (v.color) color = v.color;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    if (lane.type !== 'footpath' && v.dir !== undefined && v.dir < 0) ctx.scale(-1, 1);
+
+    if (v.type !== 'cow' && v.type !== 'pedestrian') {
+      ctx.fillStyle = color;
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      ctx.lineWidth = 1.5;
+      roundRect(ctx, -dims.w / 2, -dims.h / 2, dims.w, dims.h, 6);
+      ctx.fill(); ctx.stroke();
+
+      if (td.night) {
+        ctx.fillStyle = CONFIG.COLORS.headlight;
+        const hx = dims.w / 2 - 3;
+        ctx.beginPath(); ctx.arc(hx, -dims.h / 2 + 5, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(hx, dims.h / 2 - 5, 3, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    const emojis = { auto: '🛺', bus: '🚌', car: '🚗', bike: '🛵', cow: '🐄', pedestrian: '🚶' };
+    ctx.font = `${Math.round(Math.min(dims.w, dims.h) * 0.85)}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    if (v.dir !== undefined && v.dir < 0) ctx.scale(-1, 1); // un-mirror emoji glyph
+    ctx.fillText(emojis[v.type] || '', 0, 0);
+    ctx.restore();
+
+    if (v.type === 'bus' && v.label) {
+      ctx.font = 'bold 10px Poppins, sans-serif';
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.fillText(v.label, cx, cy + 4);
+    }
+    if (v.type === 'car' && v.isOla) {
+      ctx.font = 'bold 8px Poppins, sans-serif';
+      ctx.fillStyle = '#111';
+      ctx.textAlign = 'center';
+      ctx.fillText('OLA', cx, cy + dims.h / 2 - 4);
+    }
+
+    if (v.showHonkUntil && v.showHonkUntil > gs.now) {
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('📣', cx, cy - dims.h / 2 - 14);
+    }
+  },
+
+  drawRainStreaks(ctx, gs) {
+    ctx.strokeStyle = 'rgba(200,210,255,0.35)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 40; i++) {
+      const x = (i * 53 + (gs.now * 300) % gs.canvasWidth) % gs.canvasWidth;
+      const y = (i * 97 + (gs.now * 600) % gs.canvasHeight) % gs.canvasHeight;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - 4, y + 12); ctx.stroke();
+    }
+  },
+
+  drawPlayer(ctx, p, gs) {
+    if (p.dead) return;
+    const x = gs.sideWidth + p.visualCol * CONFIG.TILE_SIZE + CONFIG.TILE_SIZE / 2;
+    const y = gs.baseY - p.hopArc();
+
+    ctx.save();
+    ctx.translate(x, y);
+    if (p.stunned) {
+      ctx.font = '22px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('💫', 0, -34);
+    }
+    ctx.font = '34px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(CONFIG.PLAYER_EMOJI, 0, 0);
+    ctx.font = '15px sans-serif';
+    ctx.fillText(CONFIG.BACKPACK_EMOJI, 13, -8);
+    ctx.restore();
+  },
+
+  drawUI(ctx, gs, td) {
+    // UI scale follows tile size so text — and the backdrop bar behind it —
+    // stay legible on both cramped phones and zoomed-in desktop displays.
+    const s = Math.min(CONFIG.MAX_TILE / 60, Math.max(0.8, CONFIG.TILE_SIZE / 60));
+    const pad = 10 * s;
+    ctx.textBaseline = 'top';
+
+    ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 4 * s;
+
+    // HUD backdrop bar for contrast against busy traffic scenes — scales
+    // with tile size too, so it still covers the first lane row on big displays.
+    const barH = Math.max(44 * s, CONFIG.TILE_SIZE * 0.6);
+    const grad = ctx.createLinearGradient(0, 0, 0, barH);
+    grad.addColorStop(0, 'rgba(0,0,0,0.55)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.shadowBlur = 0;
+    ctx.fillRect(0, 0, gs.canvasWidth, barH);
+    ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 4 * s;
+
+    // Score, top center
+    ctx.font = `bold ${Math.round(20 * s)}px Poppins, sans-serif`;
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Lanes Survived: ${gs.player.bestRow}`, gs.canvasWidth / 2, pad);
+
+    // Best score, just under the live score
+    if (gs.highScore > 0) {
+      ctx.font = `${Math.round(12 * s)}px Poppins, sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.fillText(`Best: ${gs.highScore}`, gs.canvasWidth / 2, pad + 24 * s);
+    }
+
+    // Clock, top left
+    ctx.textAlign = 'left';
+    ctx.font = `${Math.round(16 * s)}px Poppins, sans-serif`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`🕐 ${td.label}`, pad, pad + 28 * s);
+
+    // Rush level, top right (leaves room for the mute button)
+    ctx.textAlign = 'right';
+    ctx.fillText(`Rush: ${td.rush}`, gs.canvasWidth - pad - 34 * s, pad + 28 * s);
+    ctx.shadowBlur = 0;
+
+    this.drawMuteButton(ctx, gs, s, pad);
+  },
+
+  drawMuteButton(ctx, gs, s, pad) {
+    const r = 16 * s;
+    const cx = gs.canvasWidth - pad - r;
+    const cy = pad + r;
+    gs.muteButtonRect = { x: cx - r, y: cy - r, w: r * 2, h: r * 2 };
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fill();
+    ctx.font = `${Math.round(r * 1.2)}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(gs.muted ? '🔇' : '🔊', cx, cy + 1);
+  },
+
+  drawBanner(ctx, gs, td) {
+    const alpha = Math.min(1, gs.bannerTimer);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = 'rgba(200,30,30,0.85)';
+    const h = 40;
+    ctx.fillRect(0, gs.canvasHeight * 0.28 - h / 2, gs.canvasWidth, h);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px Poppins, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(gs.bannerText, gs.canvasWidth / 2, gs.canvasHeight * 0.28);
+    ctx.restore();
+  },
+
+  drawGameOver(ctx, gs) {
+    ctx.fillStyle = 'rgba(0,0,0,0.82)';
+    ctx.fillRect(0, 0, gs.canvasWidth, gs.canvasHeight);
+
+    const cx = gs.canvasWidth / 2, cy = gs.canvasHeight / 2;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+    ctx.fillStyle = '#ff6b6b';
+    ctx.font = 'bold 34px Poppins, sans-serif';
+    ctx.fillText('GAME OVER', cx, cy - 100);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px Poppins, sans-serif';
+    wrapText(ctx, gs.deathMessage, cx, cy - 55, gs.canvasWidth - 60, 22);
+
+    ctx.font = '22px Poppins, sans-serif';
+    ctx.fillText(`Lanes Survived: ${gs.player.bestRow}`, cx, cy + 10);
+
+    if (gs.isNewHighScore) {
+      ctx.fillStyle = '#ffd21e';
+      ctx.font = 'bold 15px Poppins, sans-serif';
+      ctx.fillText('🏆 NEW BEST!', cx, cy + 34);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '14px Poppins, sans-serif';
+      ctx.fillText(`Best: ${gs.highScore}`, cx, cy + 34);
+    }
+
+    const btnW = 180, btnH = 52;
+    const btnX = cx - btnW / 2, btnY = cy + 58;
+    gs.tryAgainRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+    ctx.fillStyle = '#4CAF50';
+    roundRect(ctx, btnX, btnY, btnW, btnH, 10);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px Poppins, sans-serif';
+    ctx.fillText('TRY AGAIN', cx, btnY + btnH / 2 + 2);
+  },
+
+  drawStartScreen(ctx, gs) {
+    ctx.fillStyle = 'rgba(0,0,0,0.72)';
+    ctx.fillRect(0, 0, gs.canvasWidth, gs.canvasHeight);
+
+    const cx = gs.canvasWidth / 2;
+    let y = gs.canvasHeight * 0.28;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+    ctx.font = '54px sans-serif';
+    ctx.fillText('🧍‍♂️🛺🚌', cx, y); y += 56;
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 30px Poppins, sans-serif';
+    ctx.fillText('CROSSY RASTE', cx, y); y += 32;
+
+    ctx.font = '14px Poppins, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('Survive Bengaluru Traffic', cx, y); y += 44;
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '15px Poppins, sans-serif';
+    const lines = gs.isTouch
+      ? ['Swipe to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows and pedestrians only stun you —', 'everything else is instant game over.']
+      : ['Arrow keys or WASD to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows and pedestrians only stun you —', 'everything else is instant game over.'];
+    lines.forEach(l => { ctx.fillText(l, cx, y); y += 22; });
+
+    if (gs.highScore > 0) {
+      y += 10;
+      ctx.fillStyle = '#ffd21e';
+      ctx.font = 'bold 15px Poppins, sans-serif';
+      ctx.fillText(`🏆 Best: ${gs.highScore} lanes`, cx, y);
+      y += 10;
+    }
+
+    const btnW = 200, btnH = 54;
+    const btnX = cx - btnW / 2, btnY = gs.canvasHeight * 0.74;
+    gs.startButtonRect = { x: btnX, y: btnY, w: btnW, h: btnH };
+    ctx.fillStyle = '#4CAF50';
+    roundRect(ctx, btnX, btnY, btnW, btnH, 10);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px Poppins, sans-serif';
+    ctx.fillText(gs.isTouch ? 'TAP TO START' : 'PRESS TO START', cx, btnY + btnH / 2 + 2);
+  }
+};
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function wrapText(ctx, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(' ');
+  let line = '', lines = [];
+  for (const word of words) {
+    const test = line ? line + ' ' + word : word;
+    if (ctx.measureText(test).width > maxWidth && line) {
+      lines.push(line); line = word;
+    } else line = test;
+  }
+  lines.push(line);
+  const startY = y - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((l, i) => ctx.fillText(l, x, startY + i * lineHeight));
+}
+
+/* =========================================================================
+   GAME_LOOP + INPUT
+   ========================================================================= */
+class Game {
+  constructor() {
+    this.canvas = document.getElementById('gameCanvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.audio = new AudioManager();
+    this.now = 0;
+    this.lastTime = 0;
+    this.bannerTimer = 0;
+    this.bannerText = '';
+    this.lastTimeIdx = 0;
+    this.rainActive = false;
+    this.graceTimer = 1.0; // brief invulnerability after (re)start
+    this.tryAgainRect = null;
+    this.startButtonRect = null;
+    this.muteButtonRect = null;
+    this.started = false;
+    this.isTouch = matchMedia('(pointer: coarse)').matches;
+    this.highScore = parseInt(localStorage.getItem('crossyRasteHighScore') || '0', 10);
+    this.isNewHighScore = false;
+
+    this.resize();
+    this.newGame();
+
+    window.addEventListener('resize', () => this.resize());
+    this.setupInput();
+
+    requestAnimationFrame(t => this.loop(t));
+  }
+
+  resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    this.cols = CONFIG.COLS;
+    // Tile size follows viewport: capped by width/cols so the road never
+    // overflows, capped by height/9 so ~9 rows stay visible, clamped to a
+    // sane range — grows on a big/fullscreen display, shrinks on mobile.
+    const fit = Math.min(w / this.cols, h / 9);
+    CONFIG.TILE_SIZE = Math.max(CONFIG.MIN_TILE, Math.min(CONFIG.MAX_TILE, fit));
+    this.roadWidth = this.cols * CONFIG.TILE_SIZE;
+    this.canvasWidth = w;
+    this.canvasHeight = h;
+    this.sideWidth = Math.max(0, (this.canvasWidth - this.roadWidth) / 2);
+    this.baseY = Math.round(this.canvasHeight * 0.72);
+    this.canvas.width = this.canvasWidth;
+    this.canvas.height = this.canvasHeight;
+  }
+
+  newGame() {
+    this.worldGen = new WorldGenerator();
+    this.player = new Player(this.cols);
+    this.gameOver = false;
+    this.deathMessage = '';
+    this.bannerTimer = 0;
+    this.lastTimeIdx = 0;
+    this.graceTimer = 1.0;
+    this.isNewHighScore = false;
+    this.audio.stopRain();
+    this.rainActive = false;
+    this.worldGen.ensureUpTo(Math.ceil(this.canvasHeight / CONFIG.TILE_SIZE) + 5, this);
+  }
+
+  get muted() { return this.audio.muted; }
+
+  toggleMute() { this.audio.setMuted(!this.audio.muted); }
+
+  startGame() {
+    if (this.started) return;
+    this.started = true;
+    this.graceTimer = 1.0;
+  }
+
+  recordScore() {
+    if (this.player.bestRow > this.highScore) {
+      this.highScore = this.player.bestRow;
+      this.isNewHighScore = true;
+      localStorage.setItem('crossyRasteHighScore', String(this.highScore));
+    }
+  }
+
+  setupInput() {
+    const unlock = () => { this.audio.init(); this.audio.resume(); };
+
+    window.addEventListener('keydown', e => {
+      unlock();
+      if (e.key === 'm' || e.key === 'M') { this.toggleMute(); return; }
+      if (!this.started) { this.startGame(); return; }
+      if (this.gameOver) {
+        if (e.key === ' ' || e.key === 'Enter') this.newGame();
+        return;
+      }
+      const map = {
+        ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+        w: [0, 1], s: [0, -1], a: [-1, 0], d: [1, 0],
+        W: [0, 1], S: [0, -1], A: [-1, 0], D: [1, 0]
+      };
+      if (map[e.key]) {
+        e.preventDefault();
+        this.player.move(map[e.key][0], map[e.key][1], this);
+      }
+    });
+
+    let tsx = 0, tsy = 0;
+    this.canvas.addEventListener('touchstart', e => {
+      unlock();
+      tsx = e.touches[0].clientX; tsy = e.touches[0].clientY;
+    }, { passive: true });
+
+    this.canvas.addEventListener('touchend', e => {
+      const ex = e.changedTouches[0].clientX, ey = e.changedTouches[0].clientY;
+      if (this.handleTap(ex, ey)) return;
+      const dx = ex - tsx, dy = ey - tsy;
+      const min = 24;
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < min) return;
+      if (Math.abs(dx) > Math.abs(dy)) this.player.move(dx > 0 ? 1 : -1, 0, this);
+      else this.player.move(0, dy < 0 ? 1 : -1, this);
+    });
+
+    this.canvas.addEventListener('click', e => {
+      unlock();
+      const rect = this.canvas.getBoundingClientRect();
+      this.handleTap(e.clientX - rect.left, e.clientY - rect.top);
+    });
+  }
+
+  // Returns true when the tap was consumed by a button (mute, start, try again)
+  // so callers know not to also interpret it as a movement swipe.
+  handleTap(x, y) {
+    if (this.hitRect(this.muteButtonRect, x, y)) { this.toggleMute(); return true; }
+    if (!this.started) { if (this.hitRect(this.startButtonRect, x, y)) this.startGame(); return true; }
+    if (this.gameOver) { if (this.hitRect(this.tryAgainRect, x, y)) this.newGame(); return true; }
+    return false;
+  }
+
+  hitRect(r, x, y) {
+    return !!r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+
+  loop(t) {
+    const dt = Math.min(0.05, (t - this.lastTime) / 1000 || 0);
+    this.lastTime = t;
+    this.now += dt;
+    this.update(dt);
+    Renderer.draw(this);
+    requestAnimationFrame(tt => this.loop(tt));
+  }
+
+  update(dt) {
+    if (this.gameOver) return;
+
+    this.player.update(dt, this);
+
+    // Traffic keeps moving behind the start screen for a living backdrop,
+    // but scoring/collision/rush-hour progression only begin once started.
+    const rowsBelow = (this.canvasHeight - this.baseY) / CONFIG.TILE_SIZE + 2;
+    const minRow = Math.max(0, Math.floor(this.player.visualRow - rowsBelow));
+    const maxRow = Math.ceil(this.player.visualRow + this.canvasHeight / CONFIG.TILE_SIZE + 3);
+    for (let r = minRow; r <= maxRow; r++) {
+      const lane = this.worldGen.getLane(r, this);
+      Vehicles.update(lane, this, dt);
+      if (this.started) this.checkHonks(lane, r);
+    }
+    this.worldGen.prune(minRow);
+
+    if (!this.started) return;
+
+    if (this.graceTimer > 0) this.graceTimer -= dt;
+    if (this.bannerTimer > 0) this.bannerTimer -= dt;
+
+    if (!this.player.moving) this.checkCollisions();
+
+    const td = this.worldGen.getTimeData(this.player.bestRow);
+    const idx = Math.min(Math.floor(this.player.bestRow / 10), CONFIG.TIMES.length - 1);
+    if (idx !== this.lastTimeIdx) {
+      this.lastTimeIdx = idx;
+      this.bannerText = td.peak ? `🔥 ${td.label} — PEAK RUSH HOUR!` :
+                         td.night ? `🌙 ${td.label} — Night Mode` :
+                         `🚦 ${td.label} — ${td.rush}`;
+      this.bannerTimer = 2.5;
+      this.audio.playLevelUp();
+    }
+
+    if (td.rain && !this.rainActive) { this.audio.startRain(); this.rainActive = true; }
+    if (!td.rain && this.rainActive) { this.audio.stopRain(); this.rainActive = false; }
+  }
+
+  checkHonks(lane, row) {
+    lane.vehicles.forEach(v => {
+      if (v.honkCd === undefined) return;
+      const localX = Vehicles.localX(v, lane);
+      const vx = lane.type === 'roundabout' ? this.roadWidth / 2 + Math.cos(v.angle) * v.orbitRadius : localX;
+      const vCol = vx / CONFIG.TILE_SIZE;
+      const dist = Math.hypot(vCol - this.player.visualCol, row - this.player.visualRow);
+      if (dist <= 3) {
+        if (v.honkCd <= 0) {
+          this.audio.playHonk();
+          v.showHonkUntil = this.now + 0.6;
+          v.honkCd = 1.2 + Math.random() * 1.2;
+        }
+      }
+    });
+    if (lane.type === 'roundabout' && !lane.special.entryFlashed &&
+        Math.abs(row - this.player.row) <= 1) {
+      lane.special.entryFlashed = true;
+      this.audio.playRoundaboutFanfare();
+    }
+  }
+
+  checkCollisions() {
+    if (this.player.dead || this.graceTimer > 0) return;
+    const p = this.player;
+    const row = p.row;
+
+    const lane = this.worldGen.getLane(row, this);
+    const playerLocalX = p.col * CONFIG.TILE_SIZE + CONFIG.TILE_SIZE / 2;
+
+    for (const v of lane.vehicles) {
+      const localX = Vehicles.localX(v, lane);
+      let vLocalX, vRow = row;
+      if (lane.type === 'roundabout') {
+        vLocalX = this.roadWidth / 2 + Math.cos(v.angle) * v.orbitRadius;
+        // approximate vertical offset of orbiting vehicle in "row" units
+        vRow = row + (Math.sin(v.angle) * v.orbitRadius) / CONFIG.TILE_SIZE;
+      } else {
+        vLocalX = localX;
+      }
+      const dims = Vehicles.dims(v.type);
+      const dx = Math.abs(playerLocalX - vLocalX);
+      const dy = Math.abs(row - vRow) * CONFIG.TILE_SIZE;
+      if (dx < (dims.w / 2 + 16) && dy < (dims.h / 2 + 16)) {
+        if (v.type === 'cow' || v.type === 'pedestrian') this.player.stun(this);
+        else this.player.die(this);
+        if (this.player.dead) return;
+      }
+    }
+
+    // Pothole trip is a one-shot stumble on landing, not a repeating trap:
+    // only check it on the single frame the hop completes, otherwise the
+    // player re-trips every frame they remain stunned on the same tile.
+    if (p.landed) {
+      if (lane.type === 'pothole' && lane.special.potholes && lane.special.potholes.includes(p.col)) {
+        this.player.stun(this);
+      }
+      p.landed = false;
+    }
+
+    if (lane.type === 'barrier' && lane.special.gaps && !lane.special.gaps.includes(p.col)) {
+      this.player.die(this);
+    }
+  }
+}
+
+window.addEventListener('load', () => { new Game(); });
+</script>
+</body>
+</html>
