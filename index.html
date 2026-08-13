@@ -133,7 +133,35 @@ class AudioManager {
     osc.start(t0); osc.stop(t0 + dur);
   }
 
-  playHonk() { this._tone(420, 300, 0.16, 0.18, 'square'); }
+  // Each vehicle type gets its own horn character, and every call jitters
+  // pitch/timing a little so honks never sound like a looped sample.
+  playHonk(vType = 'car', volMult = 1) {
+    if (!this.ctx || this.muted) return;
+    const j = (spread) => (Math.random() - 0.5) * spread;
+    switch (vType) {
+      case 'auto': {
+        // quick, reedy double-parp
+        const f = 780 + j(120);
+        this._tone(f, f * 0.75, 0.06, 0.14 * volMult, 'square');
+        setTimeout(() => this._tone(f + j(40), f * 0.75, 0.06, 0.13 * volMult, 'square'), 70 + j(15));
+        break;
+      }
+      case 'bus': {
+        // deep, sustained air horn
+        this._tone(200 + j(20), 130 + j(15), 0.4 + j(0.1), 0.22 * volMult, 'sawtooth');
+        break;
+      }
+      case 'bike': {
+        // thin, high toot
+        this._tone(1150 + j(150), 950, 0.05, 0.11 * volMult, 'triangle');
+        break;
+      }
+      default: { // car / generic
+        const f = 400 + j(90);
+        this._tone(f, f * 0.72, 0.13 + j(0.05), 0.17 * volMult, Math.random() < 0.5 ? 'square' : 'sawtooth');
+      }
+    }
+  }
 
   playHop() { this._tone(900, 700, 0.06, 0.1, 'triangle'); }
 
@@ -297,7 +325,7 @@ class WorldGenerator {
           speed: baseSpeed,
           wobblePhase: Math.random() * Math.PI * 2,
           wobbleAmp: td.weave ? 10 : 4,
-          honkCd: Math.random() * 1.5
+          honkCd: Math.random()
         });
       }
     }
@@ -314,7 +342,7 @@ class WorldGenerator {
         dir,
         speed: (28 + Math.random() * 12) * td.speedMult * dir,
         label: labels[Math.floor(Math.random() * labels.length)],
-        honkCd: Math.random() * 1.5
+        honkCd: Math.random()
       });
     }
   }
@@ -331,7 +359,7 @@ class WorldGenerator {
         color: CONFIG.COLORS.car[Math.floor(Math.random() * CONFIG.COLORS.car.length)],
         isOla: Math.random() < 0.3,
         laneChangeTimer: 1 + Math.random() * 3,
-        honkCd: Math.random() * 1.5
+        honkCd: Math.random()
       });
     }
   }
@@ -349,7 +377,7 @@ class WorldGenerator {
           x: (baseX + i * 30 * dir + gs.roadWidth) % gs.roadWidth,
           dir,
           speed: baseSpeed,
-          honkCd: Math.random() * 1.5
+          honkCd: Math.random()
         });
       }
     }
@@ -366,7 +394,7 @@ class WorldGenerator {
         angle: (i / count) * Math.PI * 2,
         orbitRadius: radius * (0.55 + Math.random() * 0.5),
         angSpeed: (0.6 + Math.random() * 0.6) * td.speedMult * (Math.random() < 0.5 ? 1 : -1),
-        honkCd: Math.random() * 1.5
+        honkCd: Math.random()
       });
     }
   }
@@ -420,7 +448,10 @@ const Vehicles = {
   update(lane, gs, dt) {
     const roadWidth = gs.roadWidth;
     if (lane.type === 'roundabout') {
-      lane.vehicles.forEach(v => { v.angle += v.angSpeed * dt; });
+      lane.vehicles.forEach(v => {
+        v.angle += v.angSpeed * dt;
+        if (v.honkCd !== undefined) v.honkCd -= dt;
+      });
     } else if (lane.type === 'footpath') {
       lane.vehicles.forEach(v => {
         v.wanderTimer -= dt;
@@ -1200,16 +1231,21 @@ class Game {
   checkHonks(lane, row) {
     lane.vehicles.forEach(v => {
       if (v.honkCd === undefined) return;
+      if (v.honkCd > 0) return;
       const localX = Vehicles.localX(v, lane);
       const vx = lane.type === 'roundabout' ? this.roadWidth / 2 + Math.cos(v.angle) * v.orbitRadius : localX;
       const vCol = vx / CONFIG.TILE_SIZE;
       const dist = Math.hypot(vCol - this.player.visualCol, row - this.player.visualRow);
-      if (dist <= 3) {
-        if (v.honkCd <= 0) {
-          this.audio.playHonk();
-          v.showHonkUntil = this.now + 0.6;
-          v.honkCd = 1.2 + Math.random() * 1.2;
-        }
+      if (dist <= 3.5) {
+        // Close to the player: a loud honk with the on-screen 📣 flourish.
+        this.audio.playHonk(v.type);
+        v.showHonkUntil = this.now + 0.6;
+        v.honkCd = 0.7 + Math.random() * 0.9;
+      } else if (Math.random() < 0.012) {
+        // Further off: an occasional quiet honk for ambient city noise —
+        // keeps the soundscape alive even when nothing is near the player.
+        this.audio.playHonk(v.type, 0.35);
+        v.honkCd = 1.5 + Math.random() * 2;
       }
     });
     if (lane.type === 'roundabout' && !lane.special.entryFlashed &&
