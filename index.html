@@ -300,12 +300,15 @@ class WorldGenerator {
   _genFootpath(lane, gs, td) {
     const count = Math.floor(Math.random() * 3); // 0-2 wanderers
     for (let i = 0; i < count; i++) {
-      const isCow = Math.random() < 0.25;
+      const isAnimal = Math.random() < 0.25;
+      // Among animals: 70% stray dogs, 30% cows.
+      const type = isAnimal ? (Math.random() < 0.7 ? 'dog' : 'cow') : 'pedestrian';
+      const speed = type === 'cow' ? 12 : type === 'dog' ? 22 : 18;
       lane.vehicles.push({
-        type: isCow ? 'cow' : 'pedestrian',
+        type,
         x: Math.random() * gs.roadWidth,
         dir: Math.random() < 0.5 ? 1 : -1,
-        speed: (isCow ? 12 : 18) + Math.random() * 12,
+        speed: speed + Math.random() * 12,
         wanderTimer: 1 + Math.random() * 2
       });
     }
@@ -435,6 +438,7 @@ const Vehicles = {
     car: { w: 50, h: 34 },
     bike: { w: 26, h: 18 },
     cow: { w: 30, h: 26 },
+    dog: { w: 22, h: 18 },
     pedestrian: { w: 24, h: 24 }
   },
 
@@ -761,7 +765,7 @@ const Renderer = {
     ctx.translate(cx, cy);
     if (lane.type !== 'footpath' && v.dir !== undefined && v.dir < 0) ctx.scale(-1, 1);
 
-    if (v.type !== 'cow' && v.type !== 'pedestrian') {
+    if (v.type !== 'cow' && v.type !== 'dog' && v.type !== 'pedestrian') {
       ctx.fillStyle = color;
       ctx.strokeStyle = 'rgba(0,0,0,0.35)';
       ctx.lineWidth = 1.5;
@@ -780,7 +784,7 @@ const Renderer = {
     // read as background extras and never get mistaken for the player.
     if (v.type === 'pedestrian') { ctx.globalAlpha = 0.75; ctx.scale(0.85, 0.85); }
 
-    const emojis = { auto: '🛺', bus: '🚌', car: '🚗', bike: '🛵', cow: '🐄', pedestrian: '🚶‍♀️' };
+    const emojis = { auto: '🛺', bus: '🚌', car: '🚗', bike: '🛵', cow: '🐄', dog: '🐕', pedestrian: '🚶‍♀️' };
     ctx.font = `${Math.round(Math.min(dims.w, dims.h) * 0.85)}px sans-serif`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     if (v.dir !== undefined && v.dir < 0) ctx.scale(-1, 1); // un-mirror emoji glyph
@@ -993,8 +997,8 @@ const Renderer = {
     ctx.fillStyle = '#fff';
     ctx.font = '15px Poppins, sans-serif';
     const lines = gs.isTouch
-      ? ['Swipe to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows and pedestrians only stun you —', 'everything else is instant game over.']
-      : ['Arrow keys or WASD to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows and pedestrians only stun you —', 'everything else is instant game over.'];
+      ? ['Swipe to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows, dogs & pedestrians only stun you —', 'everything else is instant game over.']
+      : ['Arrow keys or WASD to hop across lanes.', 'Dodge autos, buses, bikes & potholes.', 'Cows, dogs & pedestrians only stun you —', 'everything else is instant game over.'];
     lines.forEach(l => { ctx.fillText(l, cx, y); y += 22; });
 
     if (gs.highScore > 0) {
@@ -1277,7 +1281,7 @@ class Game {
       const dx = Math.abs(playerLocalX - vLocalX);
       const dy = Math.abs(row - vRow) * CONFIG.TILE_SIZE;
       if (dx < (dims.w / 2 + 16) && dy < (dims.h / 2 + 16)) {
-        if (v.type === 'cow' || v.type === 'pedestrian') this.player.stun(this);
+        if (v.type === 'cow' || v.type === 'dog' || v.type === 'pedestrian') this.player.stun(this);
         else this.player.die(this);
         if (this.player.dead) return;
       }

@@ -2,8 +2,11 @@
 
 A Crossy Road-style browser game themed around surviving Indian tech-city traffic.
 
+## Play Online
+**[techjeffe.github.io/crossyraste](https://techjeffe.github.io/crossyraste/)** — hosted via GitHub Pages, no download needed.
+
 ## How to Play
-1. Open `index.html` directly in a browser (Chrome, Firefox, or Safari) — no server needed.
+1. Play it live at the link above, or open `index.html` directly in a browser (Chrome, Firefox, or Safari) — no server needed either way.
 2. Use arrow keys or WASD to move the tourist (🧍‍♂️).
 3. On mobile, swipe to move.
 4. Cross as many lanes as possible without getting hit by vehicles.
