@@ -298,9 +298,11 @@ class WorldGenerator {
   }
 
   _genFootpath(lane, gs, td) {
-    const count = Math.floor(Math.random() * 3); // 0-2 wanderers
+    // At least one wanderer per footpath tile (was 0-2, sometimes empty) so
+    // animals are actually reliable to spot instead of a rare coin-flip.
+    const count = 1 + Math.floor(Math.random() * 2);
     for (let i = 0; i < count; i++) {
-      const isAnimal = Math.random() < 0.25;
+      const isAnimal = Math.random() < 0.35;
       // Among animals: 70% stray dogs, 30% cows.
       const type = isAnimal ? (Math.random() < 0.7 ? 'dog' : 'cow') : 'pedestrian';
       const speed = type === 'cow' ? 12 : type === 'dog' ? 22 : 18;
