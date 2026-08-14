@@ -621,12 +621,18 @@ const Renderer = {
     const minRow = Math.max(0, Math.floor(gs.player.visualRow - rowsBelow));
     const maxRow = Math.ceil(gs.player.visualRow + rowSpan);
 
+    // Two passes: bases first (so a roundabout's oversized circle, which
+    // bleeds into neighboring rows, never paints over another lane), then
+    // hazards/vehicles on top so potholes etc. can't be hidden behind it.
+    const visibleRows = [];
     for (let r = minRow; r <= maxRow; r++) {
       const lane = gs.worldGen.getLane(r, gs);
       const screenY = baseY - (r - gs.player.visualRow) * CONFIG.TILE_SIZE;
       if (screenY < -CONFIG.TILE_SIZE || screenY > gs.canvasHeight + CONFIG.TILE_SIZE) continue;
-      this.drawLane(ctx, lane, screenY, gs, td);
+      visibleRows.push({ lane, screenY });
     }
+    visibleRows.forEach(({ lane, screenY }) => this.drawLaneBase(ctx, lane, screenY, gs, td));
+    visibleRows.forEach(({ lane, screenY }) => this.drawLaneContents(ctx, lane, screenY, gs, td));
 
     this.drawPlayer(ctx, gs.player, gs);
     this.drawUI(ctx, gs, td);
@@ -666,7 +672,7 @@ const Renderer = {
     });
   },
 
-  drawLane(ctx, lane, screenY, gs, td) {
+  drawLaneBase(ctx, lane, screenY, gs, td) {
     const x0 = gs.sideWidth;
     const w = gs.roadWidth;
 
@@ -700,6 +706,13 @@ const Renderer = {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText('🌳', cx, screenY);
     }
+  },
+
+  // Hazards + vehicles, drawn in a second pass over all rows so a
+  // roundabout's oversized circle (drawn in the base pass) can never
+  // paint over a neighboring lane's pothole, barrier, or traffic.
+  drawLaneContents(ctx, lane, screenY, gs, td) {
+    const x0 = gs.sideWidth;
 
     if (lane.type === 'pothole' && lane.special.potholes) {
       lane.special.potholes.forEach(tileX => {
